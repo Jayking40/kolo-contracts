@@ -990,6 +990,18 @@
                       "key": {
                         "vec": [
                           {
+                            "symbol": "CyclePaidOut"
+                          }
+                        ]
+                      },
+                      "val": {
+                        "i128": "3000"
+                      }
+                    },
+                    {
+                      "key": {
+                        "vec": [
+                          {
                             "symbol": "GroupType"
                           }
                         ]

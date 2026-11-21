@@ -69,7 +69,7 @@ initialize(
 add_member(new_member: Address)
 remove_member(member_to_remove: Address)
 contribute(member: Address, amount: i128)
-payout(expected_recipient: Address)
+payout(expected_recipient: Address, amount: Option<i128>)
 get_next_payout_recipient() -> Address
 withdraw_savings(member: Address, amount: i128)
 emergency_withdraw(member: Address)
@@ -92,7 +92,18 @@ The first contribution in a cycle freezes the current member count. Each member 
 configured contribution amount × frozen member count
 ```
 
-The contract checks that the next expected member matches the requested recipient and that the contract's token balance covers that payout. It does not itself schedule payouts or initiate a new rotation. After the payout sequence, the application must coordinate the administrator-authorized `reset_cycle()` and `reset_rotation()` calls at the appropriate time.
+The contract checks that the next expected member matches the requested recipient, that the contributions recorded in the current cycle cover that payout, and that the contract's token balance covers it as well. An administrator may request a smaller, partial payout; it is subject to the same checks. It does not itself schedule payouts or initiate a new rotation. After the payout sequence, the application must coordinate the administrator-authorized `reset_cycle()` and `reset_rotation()` calls at the appropriate time.
+
+### Direct transfers and payout readiness
+
+Soroban tokens can be sent to the contract address with a plain token `transfer`, without calling `contribute`, and the contract cannot refuse them. Such transfers raise `get_balance()`, but they are not attributed to any member and do not count towards a cycle being funded:
+
+- **Full-pool readiness is separate from balance.** A full `payout` requires the contributions recorded this cycle to cover `contribution amount × frozen member count`. Topping up the balance, even with exactly the missing member's share, does not make an underfunded cycle ready.
+- **Payouts draw down recorded contributions.** Every payout in a cycle, full or partial, is subtracted from that cycle's recorded contributions, and the total paid out can never exceed them. Surplus tokens cannot fund a second payout in the same cycle; `reset_cycle()` starts a fresh allowance.
+- **Refunds stay refunded.** `emergency_withdraw` and `remove_member` refunds take the member's contribution out of the cycle's funding; a direct transfer does not put it back.
+- **Recorded savings ignore surplus.** `GoalBased` withdrawals and target locks use each member's recorded contributions, so a surplus cannot be withdrawn as savings or used to unlock a target.
+
+Surplus tokens stay in the contract, and no entry point pays them out as such. `get_balance()` reports the raw token balance (recorded funds plus any surplus), so integrations should reconcile from contribution and payout events rather than from the balance alone.
 
 Because the contract's pool accounting, contribution readiness, and backend payout lifecycle must work together, treat these rules as code under development. Review and test the full lifecycle before deploying a public instance.
 

@@ -53,6 +53,30 @@ fn assert_not_executing_payout(env: &Env) {
     }
 }
 
+/// Sum of the contributions members have made through `contribute()` in the
+/// given cycle, read from each member's recorded state.
+///
+/// This is deliberately *not* derived from the token balance: anyone can
+/// transfer tokens straight to the contract address, and those tokens must
+/// never count towards a cycle being funded. Refunds already unwind the
+/// records this reads — `emergency_withdraw` clears the member's cycle
+/// contribution and `remove_member` deletes the member's state — so a
+/// refunded contribution drops out of the sum automatically.
+fn recorded_cycle_contributions(env: &Env, members: &Vec<Address>, cycle_id: u32) -> i128 {
+    let mut funded: i128 = 0;
+    for member in members.iter() {
+        let state: Option<MemberState> = env.storage().persistent().get(&DataKey::Member(member));
+        if let Some(state) = state {
+            if state.last_contribution_cycle_id == cycle_id {
+                funded = funded
+                    .checked_add(state.current_cycle_contribution)
+                    .expect("Math overflow in cycle contribution sum");
+            }
+        }
+    }
+    funded
+}
+
 fn require_not_paused(env: &Env) {
     let is_paused: bool = env
         .storage()
@@ -99,6 +123,9 @@ pub enum DataKey {
     /// Reentrancy guard mutex, set for the duration of payout()'s execution.
     IsExecutingPayout,
     IsPaused,
+    /// Total paid out of the current cycle's recorded contributions. Cleared
+    /// by `reset_cycle()`.
+    CyclePaidOut,
 }
 
 #[contracttype]
@@ -410,6 +437,15 @@ impl KoloSavingsContract {
     /// `require_auth_for_args`, so a partial payout can't be substituted for
     /// a full one (or vice versa) after the fact.
     ///
+    /// Readiness is based on recorded contributions, never on the token
+    /// balance. Tokens sent directly to the contract raise `get_balance()` but
+    /// are not attributed to any member, so they can't fund a payout: the
+    /// amount paid must be covered by contributions recorded this cycle that
+    /// have not already been paid out. A full payout therefore needs every
+    /// member in the frozen count to have contributed, whatever the balance.
+    /// The balance check is kept as a second guard (the contract can't pay
+    /// out more than it holds).
+    ///
     /// Follows the Checks-Effects-Interactions pattern: all validation happens
     /// first, then all state (NextPayoutIndex, the recipient's has_received_payout
     /// flag, and TTL extensions) is committed, and only then is the external
@@ -490,6 +526,30 @@ impl KoloSavingsContract {
             panic!("Insufficient funds in contract for requested payout");
         }
 
+        // A surplus balance must not stand in for missing contributions, so
+        // the payout is also capped by what was actually contributed this
+        // cycle, less anything already paid out from it.
+        let current_cycle_id: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CurrentCycleId)
+            .unwrap_or(1);
+        let cycle_funded = recorded_cycle_contributions(&env, &members, current_cycle_id);
+        let cycle_paid_out: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CyclePaidOut)
+            .unwrap_or(0);
+        let cycle_paid_out_after = cycle_paid_out
+            .checked_add(pool_size)
+            .expect("Math overflow in cycle payout total");
+        if cycle_paid_out_after > cycle_funded {
+            panic!("Payout exceeds contributions recorded this cycle");
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::CyclePaidOut, &cycle_paid_out_after);
         env.storage()
             .instance()
             .set(&DataKey::NextPayoutIndex, &(next_index + 1));
@@ -750,6 +810,7 @@ impl KoloSavingsContract {
 
         if group_type == GroupType::Rotational {
             env.storage().instance().remove(&DataKey::CycleMemberCount);
+            env.storage().instance().remove(&DataKey::CyclePaidOut);
         }
 
         env.events().publish((symbol_short!("reset"),), ());
