@@ -113,6 +113,26 @@ cargo build --target wasm32v1-none --release
 
 The release Wasm artifact is written to `contracts/target/wasm32v1-none/release/`. This target is required by Soroban SDK 27 with current Rust toolchains; `wasm32-unknown-unknown` is rejected by the SDK on newer Rust versions.
 
+## Deploying to Testnet from CI
+
+Pushes and pull requests only build and test the contract. A Testnet deployment happens only when a maintainer starts the **Deploy to Testnet** workflow by hand (Actions → Deploy to Testnet → Run workflow) on `main`, and a reviewer approves the `testnet` environment.
+
+The workflow runs in two jobs:
+
+1. **Validate request and build Wasm** has no access to secrets. It refuses any network other than Testnet and any ref other than `main`, then runs the tests, builds and optimizes the Wasm, and records its SHA-256 digest.
+2. **Deploy to Testnet** waits for environment approval. It does not check out the repository. It checks the deployer configuration, confirms that the deployer account exists on Testnet and that the RPC endpoint reports the Testnet passphrase, verifies the Wasm digest, and deploys. The job summary lists only public values: the contract ID, the deployer's public address, the Wasm digest, and the commit.
+
+If `STELLAR_DEPLOYER_KEY` is not configured, the deploy job writes a notice and finishes without deploying.
+
+One-time setup, under **Settings → Environments → `testnet`**:
+
+- **Required reviewers:** at least one maintainer.
+- **Deployment branches and tags:** restrict to `main`.
+- **Environment secret `STELLAR_DEPLOYER_KEY`:** the deployer's Testnet secret key (`S…`). Store it on the environment, not as a repository secret, so only the approved deploy job can read it.
+- **Environment variable `STELLAR_DEPLOYER_ADDRESS`:** the matching public key (`G…`). The transaction is sent from this address and signed with the secret, so a key that does not belong to it is rejected before anything is deployed.
+
+Use a dedicated, Friendbot-funded Testnet account for this. Production deployment is out of scope for this workflow.
+
 ## Integration with Kolo
 
 The [Kolo backend](https://github.com/Stellar-Kolo/kolo-backend) is responsible for loading the compiled Wasm, deploying contract instances, constructing and simulating Soroban transactions, obtaining authorization, submitting through Soroban RPC, and waiting for confirmation. It also needs to keep contract state and PostgreSQL records reconcilable. The [Kolo frontend](https://github.com/Stellar-Kolo/kolo-frontend) is the web companion; the planned primary member experience is WhatsApp-first.

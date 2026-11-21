@@ -1,0 +1,259 @@
+name: Deploy to Testnet
+
+# Deployments never start from a push or a pull request. A maintainer has to
+# dispatch this workflow by hand from `main`, and the job that can read the
+# deployer key waits for a reviewer to approve the `testnet` environment.
+#
+# Repository setup (Settings -> Environments -> testnet):
+#   - Required reviewers: at least one maintainer.
+#   - Deployment branches: `main` only.
+#   - Secret   STELLAR_DEPLOYER_KEY      the deployer's secret key (S...).
+#   - Variable STELLAR_DEPLOYER_ADDRESS  the matching public key (G...).
+on:
+  workflow_dispatch:
+    inputs:
+      network:
+        description: Target network. Only Stellar Testnet is supported.
+        type: choice
+        options: [testnet]
+        default: testnet
+        required: true
+
+permissions:
+  contents: read
+
+# One deployment at a time; a second dispatch queues instead of racing.
+concurrency:
+  group: testnet-deploy
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  WORKING_DIR: contracts
+  WASM_ARTIFACT: kolo-savings-group-testnet-wasm
+  WASM_FILE: kolo_savings_group.optimized.wasm
+  TESTNET_RPC_URL: https://soroban-testnet.stellar.org
+  TESTNET_HORIZON_URL: https://horizon-testnet.stellar.org
+  TESTNET_PASSPHRASE: Test SDF Network ; September 2015
+
+jobs:
+  build:
+    name: Validate request and build Wasm
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # No secrets are referenced here. Compiling (including dependency build
+    # scripts) happens in a job that has nothing worth stealing.
+    outputs:
+      wasm-sha256: ${{ steps.digest.outputs.sha256 }}
+    defaults:
+      run:
+        working-directory: ${{ env.WORKING_DIR }}
+
+    steps:
+      - name: Validate dispatch request
+        working-directory: .
+        env:
+          REQUESTED_NETWORK: ${{ inputs.network }}
+        run: |
+          set -euo pipefail
+          if [[ "$REQUESTED_NETWORK" != "testnet" ]]; then
+            echo "::error::Only Stellar Testnet deployments are allowed from CI."
+            exit 1
+          fi
+          if [[ "$GITHUB_REF" != "refs/heads/main" ]]; then
+            echo "::error::Testnet deployments must be dispatched from main, not $GITHUB_REF."
+            exit 1
+          fi
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32v1-none
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ${{ env.WORKING_DIR }}
+
+      - name: Run tests
+        run: cargo test --locked
+
+      - name: Build and optimize Wasm
+        run: |
+          set -euo pipefail
+          RUSTFLAGS="-C target-cpu=mvp" cargo build \
+            --locked \
+            --target wasm32v1-none \
+            --release
+          cargo install wasm-opt --locked
+          wasm-opt \
+            target/wasm32v1-none/release/kolo_savings_group.wasm \
+            -o "target/wasm32v1-none/release/$WASM_FILE"
+
+      - name: Record Wasm digest
+        id: digest
+        run: |
+          set -euo pipefail
+          sha256="$(sha256sum "target/wasm32v1-none/release/$WASM_FILE" | cut -d' ' -f1)"
+          echo "sha256=$sha256" >> "$GITHUB_OUTPUT"
+
+      - name: Upload Wasm artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.WASM_ARTIFACT }}
+          path: ${{ env.WORKING_DIR }}/target/wasm32v1-none/release/${{ env.WASM_FILE }}
+          if-no-files-found: error
+          retention-days: 7
+
+  deploy:
+    name: Deploy to Testnet
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # The environment's required reviewers are the human approval step, and
+    # its secrets are only released to this job once someone approves.
+    environment:
+      name: testnet
+      url: ${{ steps.deploy.outputs.explorer-url }}
+
+    # This job deliberately does not check out the repository. It only
+    # receives the Wasm built above, so no repository code runs next to the key.
+    steps:
+      - name: Check deployer configuration
+        id: config
+        env:
+          HAS_DEPLOYER_KEY: ${{ secrets.STELLAR_DEPLOYER_KEY != '' }}
+        run: |
+          set -euo pipefail
+          if [[ "$HAS_DEPLOYER_KEY" != "true" ]]; then
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::STELLAR_DEPLOYER_KEY is not set for the testnet environment; skipping deployment."
+            {
+              echo "### Testnet deployment skipped"
+              echo
+              echo "\`STELLAR_DEPLOYER_KEY\` is not configured for the \`testnet\` environment, so nothing was deployed."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          echo "configured=true" >> "$GITHUB_OUTPUT"
+
+      - name: Validate source account
+        if: steps.config.outputs.configured == 'true'
+        env:
+          DEPLOYER_KEY: ${{ secrets.STELLAR_DEPLOYER_KEY }}
+          DEPLOYER_ADDRESS: ${{ vars.STELLAR_DEPLOYER_ADDRESS }}
+        run: |
+          set -euo pipefail
+          # Format checks only; neither value is ever printed.
+          if [[ ! "$DEPLOYER_KEY" =~ ^S[A-Z2-7]{55}$ ]]; then
+            echo "::error::STELLAR_DEPLOYER_KEY is not a Stellar secret key (expected S... with 56 characters)."
+            exit 1
+          fi
+          if [[ -z "$DEPLOYER_ADDRESS" ]]; then
+            echo "::error::Set the STELLAR_DEPLOYER_ADDRESS variable on the testnet environment to the deployer's public key."
+            exit 1
+          fi
+          if [[ ! "$DEPLOYER_ADDRESS" =~ ^G[A-Z2-7]{55}$ ]]; then
+            echo "::error::STELLAR_DEPLOYER_ADDRESS is not a Stellar public key (expected G... with 56 characters)."
+            exit 1
+          fi
+
+          status="$(curl --silent --show-error --retry 3 --max-time 20 \
+            --output /dev/null --write-out '%{http_code}' \
+            "$TESTNET_HORIZON_URL/accounts/$DEPLOYER_ADDRESS")"
+          case "$status" in
+            200) echo "Deployer account $DEPLOYER_ADDRESS exists on Testnet." ;;
+            404)
+              echo "::error::Deployer account $DEPLOYER_ADDRESS does not exist on Testnet. Fund it with Friendbot first."
+              exit 1
+              ;;
+            *)
+              echo "::error::Could not look up the deployer account on Testnet Horizon (HTTP $status)."
+              exit 1
+              ;;
+          esac
+
+      - name: Validate Testnet RPC
+        if: steps.config.outputs.configured == 'true'
+        run: |
+          set -euo pipefail
+          response="$(curl --fail --silent --show-error --retry 3 --max-time 20 \
+            --header 'Content-Type: application/json' \
+            --data '{"jsonrpc":"2.0","id":1,"method":"getNetwork"}' \
+            "$TESTNET_RPC_URL")"
+          passphrase="$(jq -r '.result.passphrase // empty' <<<"$response")"
+          if [[ "$passphrase" != "$TESTNET_PASSPHRASE" ]]; then
+            echo "::error::$TESTNET_RPC_URL did not report the Testnet network passphrase; refusing to deploy."
+            exit 1
+          fi
+          echo "RPC endpoint confirmed as Stellar Testnet."
+
+      - name: Download Wasm artifact
+        if: steps.config.outputs.configured == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.WASM_ARTIFACT }}
+          path: wasm
+
+      - name: Verify Wasm digest
+        if: steps.config.outputs.configured == 'true'
+        env:
+          EXPECTED_SHA256: ${{ needs.build.outputs.wasm-sha256 }}
+        run: |
+          set -euo pipefail
+          echo "$EXPECTED_SHA256  wasm/$WASM_FILE" | sha256sum --check --strict
+
+      - name: Install Stellar CLI
+        if: steps.config.outputs.configured == 'true'
+        uses: stellar/stellar-cli@v30.0.1
+
+      - name: Deploy contract
+        id: deploy
+        if: steps.config.outputs.configured == 'true'
+        env:
+          DEPLOYER_KEY: ${{ secrets.STELLAR_DEPLOYER_KEY }}
+          DEPLOYER_ADDRESS: ${{ vars.STELLAR_DEPLOYER_ADDRESS }}
+          WASM_SHA256: ${{ needs.build.outputs.wasm-sha256 }}
+        run: |
+          set -euo pipefail
+          # The transaction source is the public address configured on the
+          # environment, and the secret key only signs. A key that does not
+          # belong to that address fails authorization and deploys nothing.
+          # Network settings are passed explicitly instead of relying on a
+          # named network from CLI config.
+          output="$(stellar contract deploy \
+            --wasm "wasm/$WASM_FILE" \
+            --source-account "$DEPLOYER_ADDRESS" \
+            --sign-with-key "$DEPLOYER_KEY" \
+            --rpc-url "$TESTNET_RPC_URL" \
+            --network-passphrase "$TESTNET_PASSPHRASE")"
+
+          contract_id="$(printf '%s\n' "$output" | awk 'NF { last = $0 } END { gsub(/[[:space:]]/, "", last); print last }')"
+          if [[ ! "$contract_id" =~ ^C[A-Z2-7]{55}$ ]]; then
+            echo "::error::Deployment finished but the CLI did not return a contract ID."
+            exit 1
+          fi
+
+          explorer_url="https://stellar.expert/explorer/testnet/contract/$contract_id"
+          echo "contract-id=$contract_id" >> "$GITHUB_OUTPUT"
+          echo "explorer-url=$explorer_url" >> "$GITHUB_OUTPUT"
+
+          # Only public values go into the summary.
+          {
+            echo "### Testnet deployment"
+            echo
+            echo "| | |"
+            echo "| --- | --- |"
+            echo "| Network | Stellar Testnet |"
+            echo "| Contract ID | \`$contract_id\` |"
+            echo "| Deployer | \`$DEPLOYER_ADDRESS\` |"
+            echo "| Wasm SHA-256 | \`$WASM_SHA256\` |"
+            echo "| Commit | \`$GITHUB_SHA\` |"
+            echo
+            echo "[View contract on Stellar Expert]($explorer_url)"
+          } >> "$GITHUB_STEP_SUMMARY"
