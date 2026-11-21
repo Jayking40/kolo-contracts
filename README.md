@@ -105,6 +105,16 @@ Soroban tokens can be sent to the contract address with a plain token `transfer`
 
 Surplus tokens stay in the contract, and no entry point pays them out as such. `get_balance()` reports the raw token balance (recorded funds plus any surplus), so integrations should reconcile from contribution and payout events rather than from the balance alone.
 
+### Emergency recovery scope
+
+`emergency_withdraw(member)` is the only way funds leave the contract while it is paused. It is a self-service refund, not an administrator recovery tool:
+
+- **Authority.** Only `member` can authorize it. The administrator can pause the group but cannot trigger a refund on a member's behalf, and one member cannot authorize a refund for another. Non-members are rejected.
+- **Recipient.** The refund always goes to `member`. The call has no recipient argument, so it cannot be redirected.
+- **Amount.** The call has no amount argument. The refund is the member's contribution in the *current* cycle, capped by the savings they still have on record (a `GoalBased` member who already withdrew part of it gets only the remainder) and by the cycle's recorded contributions not yet paid out. Once a cycle's contributions have been paid to a recipient, they cannot be refunded again, and surplus tokens never fund a refund.
+- **Out of scope.** Contributions from earlier cycles, surplus tokens, and contributions already paid out are not recoverable through this call. After a partial payout, the unpaid remainder is refunded in the order members ask for it; the contract does not decide how a shortfall is shared.
+- **Atomicity.** Every rejection happens before state is written, and a failed token transfer reverts the whole invocation, so a refused call changes no balance or record. A refund also cannot run while a payout is mid-execution.
+
 Because the contract's pool accounting, contribution readiness, and backend payout lifecycle must work together, treat these rules as code under development. Review and test the full lifecycle before deploying a public instance.
 
 ## Build and test

@@ -2296,3 +2296,547 @@ fn test_surplus_does_not_satisfy_goalbased_lock_target() {
     // Withdrawal must still be blocked by the target lock.
     client.withdraw_savings(&member, &500);
 }
+
+// ---------------------------------------------------------------------------
+// Emergency recovery authorization tests (Wave 038)
+// ---------------------------------------------------------------------------
+//
+// `emergency_withdraw` is the only way funds leave the contract while it is
+// paused, so it must be impossible to use it to move someone else's money.
+// Its scope is deliberately narrow:
+//
+//   - Authority: only the member being refunded can authorize the call. The
+//     admin cannot trigger it for them, and neither can another member.
+//   - Recipient: the refund always goes to that member. There is no recipient
+//     argument to redirect.
+//   - Amount: there is no amount argument either. The refund is the member's
+//     own current-cycle contribution, capped by the savings they still have
+//     on record and by the cycle contributions not yet paid out. Surplus
+//     tokens never fund a refund.
+//
+// Failure atomicity is checked by snapshotting every balance and storage
+// entry a refund can touch, attempting a rejected call through the `try_`
+// client, and asserting the snapshot is unchanged.
+
+/// Every balance and storage entry an emergency refund can move.
+#[derive(Debug, PartialEq)]
+struct RecoveryLedger {
+    contract_balance: i128,
+    admin_balance: i128,
+    member_balances: [i128; 3],
+    member_states: [Option<MemberState>; 3],
+    cycle_member_count: Option<i128>,
+    cycle_paid_out: Option<i128>,
+}
+
+fn read_recovery_ledger(
+    env: &Env,
+    contract_id: &Address,
+    token_client: &token::StellarAssetClient,
+    admin: &Address,
+    members: &[Address; 3],
+) -> RecoveryLedger {
+    let (member_states, cycle_member_count, cycle_paid_out) = env.as_contract(contract_id, || {
+        let storage = env.storage();
+        (
+            core::array::from_fn(|i| {
+                storage
+                    .persistent()
+                    .get(&DataKey::Member(members[i].clone()))
+            }),
+            storage.instance().get(&DataKey::CycleMemberCount),
+            storage.instance().get(&DataKey::CyclePaidOut),
+        )
+    });
+
+    RecoveryLedger {
+        contract_balance: token_client.balance(contract_id),
+        admin_balance: token_client.balance(admin),
+        member_balances: core::array::from_fn(|i| token_client.balance(&members[i])),
+        member_states,
+        cycle_member_count,
+        cycle_paid_out,
+    }
+}
+
+/// Replaces all mocked auths with a single one: `signer` authorizing
+/// `emergency_withdraw(member)`. Any other `require_auth` will fail.
+fn mock_emergency_withdraw_auth(
+    env: &Env,
+    contract_id: &Address,
+    signer: &Address,
+    member: &Address,
+) {
+    env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+        address: signer,
+        invoke: &soroban_sdk::testutils::MockAuthInvoke {
+            contract: contract_id,
+            fn_name: "emergency_withdraw",
+            args: (member.clone(),).into_val(env),
+            sub_invokes: &[],
+        },
+    }]);
+}
+
+/// All three members contribute, then the admin pauses the contract.
+fn setup_paused_funded_group(
+    env: &Env,
+) -> (
+    Address,
+    KoloSavingsContractClient<'_>,
+    token::StellarAssetClient<'_>,
+    Address,
+    [Address; 3],
+) {
+    let (contract_id, client, _token, token_client, admin, members) =
+        setup_rotational_group(env, 1000);
+    for m in &members {
+        client.contribute(m, &1000);
+    }
+    client.pause();
+    (contract_id, client, token_client, admin, members)
+}
+
+// -- authorization --
+
+/// The member's signature over `emergency_withdraw(member)` is the one and
+/// only authorization the call asks for: no admin signature is involved.
+#[test]
+fn test_emergency_withdraw_requires_only_the_members_own_auth() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (contract_id, client, _token_client, _admin, members) = setup_paused_funded_group(&env);
+
+    client.emergency_withdraw(&members[1]);
+
+    let auths = env.auths();
+    assert_eq!(auths.len(), 1);
+    let (signer, invocation) = &auths[0];
+    assert_eq!(*signer, members[1]);
+    assert_eq!(
+        invocation.function,
+        soroban_sdk::testutils::AuthorizedFunction::Contract((
+            contract_id.clone(),
+            soroban_sdk::Symbol::new(&env, "emergency_withdraw"),
+            (members[1].clone(),).into_val(&env),
+        ))
+    );
+    assert!(invocation.sub_invocations.is_empty());
+}
+
+/// The admin can pause the group, but cannot pull a member's contribution out
+/// on their behalf.
+#[test]
+#[should_panic(expected = "Error(Auth, InvalidAction)")]
+fn test_admin_cannot_emergency_withdraw_for_a_member() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (contract_id, client, _token_client, admin, members) = setup_paused_funded_group(&env);
+
+    mock_emergency_withdraw_auth(&env, &contract_id, &admin, &members[0]);
+    client.emergency_withdraw(&members[0]);
+}
+
+/// A rejected admin attempt must not touch any balance or record.
+#[test]
+fn test_rejected_admin_emergency_withdraw_changes_nothing() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (contract_id, client, token_client, admin, members) = setup_paused_funded_group(&env);
+    let before = read_recovery_ledger(&env, &contract_id, &token_client, &admin, &members);
+
+    mock_emergency_withdraw_auth(&env, &contract_id, &admin, &members[0]);
+    assert!(client.try_emergency_withdraw(&members[0]).is_err());
+
+    assert_eq!(
+        read_recovery_ledger(&env, &contract_id, &token_client, &admin, &members),
+        before
+    );
+}
+
+/// One member's signature cannot authorize a refund of another member's
+/// contribution.
+#[test]
+#[should_panic(expected = "Error(Auth, InvalidAction)")]
+fn test_member_cannot_emergency_withdraw_for_another_member() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (contract_id, client, _token_client, _admin, members) = setup_paused_funded_group(&env);
+
+    mock_emergency_withdraw_auth(&env, &contract_id, &members[0], &members[2]);
+    client.emergency_withdraw(&members[2]);
+}
+
+/// A rejected cross-member attempt must not touch any balance or record.
+#[test]
+fn test_rejected_cross_member_emergency_withdraw_changes_nothing() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (contract_id, client, token_client, admin, members) = setup_paused_funded_group(&env);
+    let before = read_recovery_ledger(&env, &contract_id, &token_client, &admin, &members);
+
+    mock_emergency_withdraw_auth(&env, &contract_id, &members[0], &members[2]);
+    assert!(client.try_emergency_withdraw(&members[2]).is_err());
+
+    assert_eq!(
+        read_recovery_ledger(&env, &contract_id, &token_client, &admin, &members),
+        before
+    );
+}
+
+/// An outsider signing for a member gets nothing, and the member can still
+/// recover their contribution afterwards — the failed call consumed nothing.
+#[test]
+fn test_outsider_cannot_emergency_withdraw_for_a_member() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (contract_id, client, token_client, admin, members) = setup_paused_funded_group(&env);
+    let outsider = Address::generate(&env);
+    let before = read_recovery_ledger(&env, &contract_id, &token_client, &admin, &members);
+
+    mock_emergency_withdraw_auth(&env, &contract_id, &outsider, &members[1]);
+    assert!(client.try_emergency_withdraw(&members[1]).is_err());
+
+    assert_eq!(
+        read_recovery_ledger(&env, &contract_id, &token_client, &admin, &members),
+        before
+    );
+    assert_eq!(token_client.balance(&outsider), 0);
+
+    mock_emergency_withdraw_auth(&env, &contract_id, &members[1], &members[1]);
+    client.emergency_withdraw(&members[1]);
+    assert_eq!(token_client.balance(&members[1]), 10_000);
+}
+
+/// Someone outside the group cannot use their own signature to pull funds,
+/// even with surplus tokens sitting in the contract.
+#[test]
+#[should_panic(expected = "Not a member")]
+fn test_non_member_emergency_withdraw_panics() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (contract_id, client, token_client, _admin, _members) = setup_paused_funded_group(&env);
+    token_client.mint(&contract_id, &5000);
+
+    let outsider = Address::generate(&env);
+    client.emergency_withdraw(&outsider);
+}
+
+/// A rejected non-member call leaves every balance and record untouched.
+#[test]
+fn test_non_member_emergency_withdraw_changes_nothing() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (contract_id, client, token_client, admin, members) = setup_paused_funded_group(&env);
+    let outsider = Address::generate(&env);
+    let before = read_recovery_ledger(&env, &contract_id, &token_client, &admin, &members);
+
+    assert!(client.try_emergency_withdraw(&outsider).is_err());
+
+    assert_eq!(
+        read_recovery_ledger(&env, &contract_id, &token_client, &admin, &members),
+        before
+    );
+    assert_eq!(token_client.balance(&outsider), 0);
+}
+
+/// Recovery exists for a paused group only.
+#[test]
+#[should_panic(expected = "Contract is not paused")]
+fn test_emergency_withdraw_while_unpaused_panics() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_contract_id, client, _token, _token_client, _admin, members) =
+        setup_rotational_group(&env, 1000);
+
+    client.contribute(&members[0], &1000);
+    client.emergency_withdraw(&members[0]);
+}
+
+/// Defense in depth: a refund cannot run while a payout is mid-execution,
+/// in case a token callback ever manages to reach it.
+#[test]
+#[should_panic(expected = "Reentrancy detected")]
+fn test_emergency_withdraw_blocked_while_payout_executing() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (contract_id, client, _token_client, _admin, members) = setup_paused_funded_group(&env);
+
+    env.as_contract(&contract_id, || {
+        env.storage()
+            .instance()
+            .set(&DataKey::IsExecutingPayout, &true);
+    });
+
+    client.emergency_withdraw(&members[0]);
+}
+
+// -- recipient --
+
+/// The refund lands with the member who contributed and nobody else: other
+/// members, the admin, and the surplus are all untouched, and the event
+/// names that member and the exact amount.
+#[test]
+fn test_emergency_refund_goes_only_to_the_contributing_member() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (contract_id, client, token_client, admin, members) = setup_paused_funded_group(&env);
+    token_client.mint(&contract_id, &700);
+    let before = read_recovery_ledger(&env, &contract_id, &token_client, &admin, &members);
+
+    client.emergency_withdraw(&members[1]);
+
+    assert_eq!(
+        env.events().all().filter_by_contract(&contract_id),
+        vec![
+            &env,
+            (
+                contract_id.clone(),
+                soroban_sdk::vec![
+                    &env,
+                    symbol_short!("emg_wd").into_val(&env),
+                    members[1].clone().into_val(&env)
+                ],
+                1000i128.into_val(&env)
+            )
+        ]
+    );
+
+    let after = read_recovery_ledger(&env, &contract_id, &token_client, &admin, &members);
+    assert_eq!(after.contract_balance, before.contract_balance - 1000);
+    assert_eq!(after.admin_balance, before.admin_balance);
+    assert_eq!(after.member_balances[0], before.member_balances[0]);
+    assert_eq!(after.member_balances[1], before.member_balances[1] + 1000);
+    assert_eq!(after.member_balances[2], before.member_balances[2]);
+    assert_eq!(after.member_states[0], before.member_states[0]);
+    assert_eq!(after.member_states[2], before.member_states[2]);
+    assert_eq!(after.cycle_member_count, Some(2));
+    // 2000 recorded contributions + the 700 surplus remain.
+    assert_eq!(after.contract_balance, 2700);
+}
+
+// -- amount --
+
+/// A member who has not contributed this cycle has nothing to recover, even
+/// when the contract holds other members' money and surplus.
+#[test]
+#[should_panic(expected = "No contribution to withdraw this cycle")]
+fn test_emergency_withdraw_without_contribution_panics() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (contract_id, client, _token, token_client, _admin, members) =
+        setup_rotational_group(&env, 1000);
+
+    client.contribute(&members[0], &1000);
+    client.contribute(&members[1], &1000);
+    token_client.mint(&contract_id, &1000);
+    client.pause();
+
+    client.emergency_withdraw(&members[2]);
+}
+
+/// Contributions from earlier cycles are out of recovery scope — they may
+/// already have been paid to that cycle's recipient.
+#[test]
+#[should_panic(expected = "No contribution to withdraw this cycle")]
+fn test_emergency_withdraw_cannot_reclaim_previous_cycle_contribution() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_contract_id, client, _token, _token_client, _admin, members) =
+        setup_rotational_group(&env, 1000);
+
+    for m in &members {
+        client.contribute(m, &1000);
+    }
+    client.reset_cycle();
+    client.pause();
+
+    client.emergency_withdraw(&members[0]);
+}
+
+/// A zero or negative recorded contribution is never refunded, and the
+/// rejection leaves state exactly as it was.
+#[test]
+fn test_emergency_withdraw_rejects_non_positive_recorded_contribution() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (contract_id, client, token_client, admin, members) = setup_paused_funded_group(&env);
+
+    for bogus_amount in [0i128, -1000] {
+        env.as_contract(&contract_id, || {
+            let key = DataKey::Member(members[0].clone());
+            let mut state: MemberState = env.storage().persistent().get(&key).unwrap();
+            state.current_cycle_contribution = bogus_amount;
+            env.storage().persistent().set(&key, &state);
+        });
+        let before = read_recovery_ledger(&env, &contract_id, &token_client, &admin, &members);
+
+        assert!(client.try_emergency_withdraw(&members[0]).is_err());
+
+        assert_eq!(
+            read_recovery_ledger(&env, &contract_id, &token_client, &admin, &members),
+            before
+        );
+    }
+}
+
+/// Once the cycle's contributions have been paid out in full, there is
+/// nothing left to refund. Surplus tokens must not be used to cover it.
+#[test]
+fn test_emergency_withdraw_cannot_reclaim_contribution_already_paid_out() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (contract_id, client, _token, token_client, admin, members) =
+        setup_rotational_group(&env, 1000);
+
+    for m in &members {
+        client.contribute(m, &1000);
+    }
+    client.payout(&members[0], &None);
+    token_client.mint(&contract_id, &5000);
+    client.pause();
+    let before = read_recovery_ledger(&env, &contract_id, &token_client, &admin, &members);
+
+    for m in &members {
+        assert!(client.try_emergency_withdraw(m).is_err());
+    }
+
+    let after = read_recovery_ledger(&env, &contract_id, &token_client, &admin, &members);
+    assert_eq!(after, before);
+    assert_eq!(after.contract_balance, 5000);
+}
+
+#[test]
+#[should_panic(expected = "Refund exceeds unpaid contributions this cycle")]
+fn test_emergency_withdraw_after_full_payout_panics() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (contract_id, client, _token, token_client, _admin, members) =
+        setup_rotational_group(&env, 1000);
+
+    for m in &members {
+        client.contribute(m, &1000);
+    }
+    client.payout(&members[0], &None);
+    token_client.mint(&contract_id, &5000);
+    client.pause();
+
+    client.emergency_withdraw(&members[1]);
+}
+
+/// After a partial payout, refunds draw on what is left of the cycle's
+/// recorded contributions and stop once it is used up, so payouts plus
+/// refunds never exceed what members actually put in.
+#[test]
+fn test_emergency_refunds_limited_to_unpaid_contributions_after_partial_payout() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (contract_id, client, _token, token_client, _admin, members) =
+        setup_rotational_group(&env, 1000);
+
+    for m in &members {
+        client.contribute(m, &1000);
+    }
+    client.payout(&members[0], &Some(1000));
+    token_client.mint(&contract_id, &400);
+    client.pause();
+
+    client.emergency_withdraw(&members[1]);
+    client.emergency_withdraw(&members[2]);
+    assert_eq!(token_client.balance(&members[1]), 10_000);
+    assert_eq!(token_client.balance(&members[2]), 10_000);
+
+    // members[0] was paid 1000 from the pool; the remaining 2000 has gone back
+    // to the other two, so only the 400 surplus is left — and it is not theirs.
+    assert!(client.try_emergency_withdraw(&members[0]).is_err());
+    assert_eq!(token_client.balance(&members[0]), 10_000);
+    assert_eq!(client.get_balance(), 400);
+}
+
+/// GoalBased contributions vary, and the refund is exactly what the member
+/// put in this cycle — surplus in the contract does not inflate it.
+#[test]
+fn test_goalbased_emergency_refund_is_exact_contribution() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (contract_id, client, _token, token_client, member) =
+        setup_goalbased_group(&env, 1000, None, false);
+
+    client.contribute(&member, &2500);
+    token_client.mint(&contract_id, &1000);
+    client.pause();
+
+    client.emergency_withdraw(&member);
+
+    assert_eq!(token_client.balance(&member), 20_000);
+    assert_eq!(client.get_contribution(&member), 0);
+    assert_eq!(client.get_balance(), 1000);
+}
+
+/// A GoalBased member who already withdrew part of this cycle's contribution
+/// can only recover what is still on record — never the full original
+/// amount, which would come out of other members' savings.
+#[test]
+fn test_goalbased_emergency_refund_capped_by_remaining_savings() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_contract_id, client, _token, token_client, member) =
+        setup_goalbased_group(&env, 1000, None, false);
+    let saver = Address::generate(&env);
+    client.add_member(&saver);
+    token_client.mint(&saver, &20_000);
+
+    client.contribute(&member, &2000);
+    client.contribute(&saver, &3000);
+    client.withdraw_savings(&member, &500);
+    client.pause();
+
+    client.emergency_withdraw(&member);
+
+    // 20000 - 2000 + 500 (withdrawal) + 1500 (refund) = 20000
+    assert_eq!(token_client.balance(&member), 20_000);
+    assert_eq!(client.get_contribution(&member), 0);
+    // The other saver's 3000 is fully intact.
+    assert_eq!(client.get_balance(), 3000);
+    assert_eq!(client.get_contribution(&saver), 3000);
+}
+
+/// A GoalBased member who has withdrawn everything has nothing to recover,
+/// and the attempt cannot touch another member's savings.
+#[test]
+fn test_goalbased_emergency_withdraw_after_full_withdrawal_changes_nothing() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_contract_id, client, _token, token_client, member) =
+        setup_goalbased_group(&env, 1000, None, false);
+    let saver = Address::generate(&env);
+    client.add_member(&saver);
+    token_client.mint(&saver, &20_000);
+
+    client.contribute(&member, &2000);
+    client.contribute(&saver, &3000);
+    client.withdraw_savings(&member, &2000);
+    client.pause();
+
+    assert!(client.try_emergency_withdraw(&member).is_err());
+
+    assert_eq!(token_client.balance(&member), 20_000);
+    assert_eq!(client.get_contribution(&member), 0);
+    assert_eq!(client.get_balance(), 3000);
+    assert_eq!(client.get_contribution(&saver), 3000);
+}
+
+#[test]
+#[should_panic(expected = "No savings left to refund")]
+fn test_goalbased_emergency_withdraw_after_full_withdrawal_panics() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_contract_id, client, _token, _token_client, member) =
+        setup_goalbased_group(&env, 1000, None, false);
+
+    client.contribute(&member, &2000);
+    client.withdraw_savings(&member, &2000);
+    client.pause();
+
+    client.emergency_withdraw(&member);
+}

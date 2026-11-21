@@ -679,10 +679,27 @@ impl KoloSavingsContract {
             .publish((symbol_short!("withdraw"), member), amount);
     }
 
-    /// Emergency withdraw (only usable while paused). Lets a member reclaim exactly
-    /// what they contributed in the *current* cycle, and unwinds the cycle counters
+    /// Emergency withdraw (only usable while paused). Lets a member reclaim what
+    /// they contributed in the *current* cycle, and unwinds the cycle counters
     /// so the pool math stays correct if the contract is later unpaused.
+    ///
+    /// Recovery scope:
+    /// - **Authority:** only `member` can authorize their own refund. The admin
+    ///   can pause the group but cannot trigger a refund for anyone, and one
+    ///   member cannot authorize a refund for another.
+    /// - **Recipient:** the refund always goes to `member`. There is no
+    ///   recipient argument, so it cannot be redirected.
+    /// - **Amount:** there is no amount argument either. The refund is the
+    ///   member's current-cycle contribution, capped by the savings they still
+    ///   have on record and by the cycle's recorded contributions that have not
+    ///   already been paid out. Surplus tokens never fund a refund.
+    /// - Contributions from earlier cycles are not recoverable here.
+    ///
+    /// Any rejection panics before state is written, and a failed token transfer
+    /// reverts the whole invocation, so a refused call changes nothing.
     pub fn emergency_withdraw(env: Env, member: Address) {
+        assert_not_executing_payout(&env);
+
         member.require_auth();
 
         let is_paused: bool = env
@@ -722,10 +739,34 @@ impl KoloSavingsContract {
             panic!("No contribution to withdraw this cycle");
         }
 
-        let amount = member_state.current_cycle_contribution;
+        // In a GoalBased group, `withdraw_savings` lowers total_contributions but
+        // leaves current_cycle_contribution alone, so refunding the latter as-is
+        // would pay the same tokens out twice — out of other members' savings.
+        let amount = member_state
+            .current_cycle_contribution
+            .min(member_state.total_contributions);
+        if amount <= 0 {
+            panic!("No savings left to refund");
+        }
 
-        // Unwind this member's contribution — can never withdraw more than they put in,
-        // because we only ever refund exactly current_cycle_contribution.
+        // Payouts already made this cycle were drawn from the recorded
+        // contributions. A refund must come out of what is left of them, never
+        // out of surplus tokens standing in for funds already paid out.
+        let cycle_funded = recorded_cycle_contributions(&env, &members, current_cycle_id);
+        let cycle_paid_out: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CyclePaidOut)
+            .unwrap_or(0);
+        let unpaid_contributions = cycle_funded
+            .checked_sub(cycle_paid_out)
+            .expect("Math underflow in unpaid contributions");
+        if amount > unpaid_contributions {
+            panic!("Refund exceeds unpaid contributions this cycle");
+        }
+
+        // Unwind this member's contribution. Together with the caps above, this
+        // means a member can never recover more than they put in and still hold.
         member_state.total_contributions = member_state
             .total_contributions
             .checked_sub(amount)
