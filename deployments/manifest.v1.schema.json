@@ -1,0 +1,256 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Stellar-Kolo/kolo-contracts/blob/main/deployments/manifest.v1.schema.json",
+  "title": "Kolo contract deployment manifest, version 1",
+  "description": "Public, verifiable facts about a non-production Kolo contract deployment. Every value is public on-chain data or public source metadata; secret keys and seed phrases must never appear here. scripts/validate_deployment_manifest.py enforces this schema plus the checks JSON Schema cannot express (StrKey checksums, Stellar Asset Contract IDs, secret scanning, and on-chain verification).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "manifest_version",
+    "production",
+    "notice",
+    "network",
+    "contract",
+    "source",
+    "deployment",
+    "initialization"
+  ],
+  "properties": {
+    "$schema": {
+      "type": "string"
+    },
+    "manifest_version": {
+      "const": 1
+    },
+    "production": {
+      "description": "Version 1 manifests describe review deployments only.",
+      "const": false
+    },
+    "notice": {
+      "description": "Human-readable warning shown to anyone reading the manifest.",
+      "type": "string",
+      "minLength": 1
+    },
+    "network": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "passphrase", "rpc_url", "horizon_url"],
+      "properties": {
+        "name": {
+          "enum": ["testnet", "futurenet"]
+        },
+        "passphrase": {
+          "type": "string"
+        },
+        "rpc_url": {
+          "$ref": "#/$defs/httpsUrl"
+        },
+        "horizon_url": {
+          "$ref": "#/$defs/httpsUrl"
+        },
+        "explorer_url": {
+          "$ref": "#/$defs/httpsUrl"
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "name": { "const": "testnet" } } },
+          "then": { "properties": { "passphrase": { "const": "Test SDF Network ; September 2015" } } }
+        },
+        {
+          "if": { "properties": { "name": { "const": "futurenet" } } },
+          "then": { "properties": { "passphrase": { "const": "Test SDF Future Network ; October 2022" } } }
+        }
+      ]
+    },
+    "contract": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "contract_id", "wasm_hash"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "contract_id": {
+          "$ref": "#/$defs/contractId"
+        },
+        "wasm_hash": {
+          "description": "SHA-256 of the uploaded Wasm bytes, as stored in the contract instance.",
+          "$ref": "#/$defs/hash"
+        },
+        "wasm_size_bytes": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository", "commit", "path", "provenance"],
+      "properties": {
+        "repository": {
+          "$ref": "#/$defs/httpsUrl"
+        },
+        "commit": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$"
+        },
+        "path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "provenance": {
+          "description": "How strongly the Wasm is tied to the commit. reproducible-build: a rebuild of the commit hashes to wasm_hash. interface-match: the contract spec matches a build of the commit, but the bytes were not reproduced. unverified: no check has been made.",
+          "enum": ["reproducible-build", "interface-match", "unverified"]
+        },
+        "toolchain": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "rustc": { "type": "string", "minLength": 1 },
+            "soroban_sdk": { "type": "string", "minLength": 1 },
+            "target": { "type": "string", "minLength": 1 },
+            "optimizer": { "type": "string", "minLength": 1 }
+          }
+        },
+        "notes": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "deployment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["deployer", "deployed_at", "ledger", "upload_transaction", "deploy_transaction"],
+      "properties": {
+        "deployer": {
+          "description": "Public account (G...) that submitted the deployment. Never the secret key.",
+          "$ref": "#/$defs/accountId"
+        },
+        "deployed_at": {
+          "$ref": "#/$defs/utcTimestamp"
+        },
+        "ledger": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "upload_transaction": {
+          "description": "Transaction that uploaded the Wasm, or null if the Wasm was already on the network.",
+          "oneOf": [{ "$ref": "#/$defs/hash" }, { "type": "null" }]
+        },
+        "deploy_transaction": {
+          "$ref": "#/$defs/hash"
+        }
+      }
+    },
+    "initialization": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "admin", "token", "transaction"],
+      "properties": {
+        "status": {
+          "enum": ["uninitialized", "initialized"]
+        },
+        "admin": {
+          "oneOf": [{ "$ref": "#/$defs/accountId" }, { "type": "null" }]
+        },
+        "token": {
+          "oneOf": [{ "$ref": "#/$defs/token" }, { "type": "null" }]
+        },
+        "transaction": {
+          "oneOf": [{ "$ref": "#/$defs/hash" }, { "type": "null" }]
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "status": { "const": "uninitialized" } } },
+          "then": {
+            "properties": {
+              "admin": { "type": "null" },
+              "token": { "type": "null" },
+              "transaction": { "type": "null" }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "status": { "const": "initialized" } } },
+          "then": {
+            "properties": {
+              "admin": { "$ref": "#/$defs/accountId" },
+              "token": { "$ref": "#/$defs/token" },
+              "transaction": { "$ref": "#/$defs/hash" }
+            }
+          }
+        }
+      ]
+    },
+    "last_verified": {
+      "description": "When this manifest was last checked against the network with --online.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["date", "ledger"],
+      "properties": {
+        "date": {
+          "type": "string",
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"
+        },
+        "ledger": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    }
+  },
+  "$defs": {
+    "accountId": {
+      "type": "string",
+      "pattern": "^G[A-Z2-7]{55}$"
+    },
+    "contractId": {
+      "type": "string",
+      "pattern": "^C[A-Z2-7]{55}$"
+    },
+    "hash": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "httpsUrl": {
+      "type": "string",
+      "pattern": "^https://[^\\s/@]+(/\\S*)?$"
+    },
+    "utcTimestamp": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+    },
+    "token": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "contract_id", "code", "issuer", "decimals"],
+      "properties": {
+        "kind": {
+          "description": "stellar-asset-contract: the built-in contract for a classic Stellar asset (its ID is derived from code and issuer). contract-token: any other SEP-41 token contract.",
+          "enum": ["stellar-asset-contract", "contract-token"]
+        },
+        "contract_id": {
+          "$ref": "#/$defs/contractId"
+        },
+        "code": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9]{1,12}$"
+        },
+        "issuer": {
+          "description": "Issuing account. Null only for native XLM.",
+          "oneOf": [{ "$ref": "#/$defs/accountId" }, { "type": "null" }]
+        },
+        "decimals": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 38
+        }
+      }
+    }
+  }
+}

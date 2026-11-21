@@ -1,0 +1,49 @@
+{
+  "$schema": "../manifest.v1.schema.json",
+  "manifest_version": 1,
+  "production": false,
+  "notice": "Stellar Testnet review deployment. Not production: the contract is uninitialized, holds no funds, and must never receive real assets.",
+  "network": {
+    "name": "testnet",
+    "passphrase": "Test SDF Network ; September 2015",
+    "rpc_url": "https://soroban-testnet.stellar.org",
+    "horizon_url": "https://horizon-testnet.stellar.org",
+    "explorer_url": "https://stellar.expert/explorer/testnet"
+  },
+  "contract": {
+    "name": "kolo_savings_group",
+    "contract_id": "CBQCB6KIXAPDPKGNZFR3KSBBJNEJRFN3MAQL7S46JGFA5I22AUL4OPYL",
+    "wasm_hash": "f68a30e74126832be3e8530d667c27f212005a8bbb3de0d096cb869bf46d3911",
+    "wasm_size_bytes": 24567
+  },
+  "source": {
+    "repository": "https://github.com/Stellar-Kolo/kolo-contracts",
+    "commit": "91ba5dfe2c7267a202db5241f34b8d8a83908f05",
+    "path": "contracts",
+    "provenance": "interface-match",
+    "toolchain": {
+      "rustc": "1.97.1",
+      "soroban_sdk": "27.0.0",
+      "target": "wasm32v1-none",
+      "optimizer": "stellar contract optimize"
+    },
+    "notes": "The deployed contract spec (contractspecv0) matches a wasm32v1-none release build of this commit. The bytes were not reproduced because the exact optimizer version was not recorded. Contract source has changed since this deployment, so main no longer matches it."
+  },
+  "deployment": {
+    "deployer": "GCEFQRSJTT5KWNZTMXK7GXSC3MC2LHMFW3YRDBKQK2UBIRIGX4KQRHLU",
+    "deployed_at": "2026-10-09T10:12:17Z",
+    "ledger": 5103430,
+    "upload_transaction": "f9d3bf0f89fd4e498fd1e098da464758f77c9d007e7ecb1d0a75951a0a600de6",
+    "deploy_transaction": "1d539b2c8f345601a54e039779a46b4fa14ccfee0e553884c2531bc2caec6f74"
+  },
+  "initialization": {
+    "status": "uninitialized",
+    "admin": null,
+    "token": null,
+    "transaction": null
+  },
+  "last_verified": {
+    "date": "2026-11-21",
+    "ledger": 5849280
+  }
+}

@@ -113,3 +113,20 @@ jobs:
       - name: Skip notice
         if: ${{ env.STELLAR_SOURCE_ACCOUNT == '' }}
         run: echo "STELLAR_DEPLOYER_KEY is not configured on this repository; skipping Testnet deployment." >> "$GITHUB_STEP_SUMMARY"
+
+  deployment-manifests:
+    name: Validate deployment manifests
+    runs-on: ubuntu-latest
+    # Offline checks only, so CI never depends on Testnet being reachable.
+    # Run the validator with --online to check manifests against the network.
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Test manifest validator
+        run: python3 -m unittest discover -s scripts -p "test_*.py" -v
+
+      - name: Validate manifests
+        run: python3 scripts/validate_deployment_manifest.py deployments/*/*.json

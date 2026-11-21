@@ -6,6 +6,10 @@ scripts/e2e-artifacts/*
 target/
 **/*.rs.bk
 
+# Python (deployment manifest tooling)
+__pycache__/
+*.pyc
+
 # Node.js
 node_modules/
 dist/

@@ -13,8 +13,19 @@ Stellar is Kolo's intended settlement network. Soroban makes it possible to repr
 - **Network:** Stellar Testnet
 - **Contract ID:** [`CBQCB6KIXAPDPKGNZFR3KSBBJNEJRFN3MAQL7S46JGFA5I22AUL4OPYL`](https://stellar.expert/explorer/testnet/contract/CBQCB6KIXAPDPKGNZFR3KSBBJNEJRFN3MAQL7S46JGFA5I22AUL4OPYL)
 - **Deployment transaction:** [View on Stellar Expert](https://stellar.expert/explorer/testnet/tx/1d539b2c8f345601a54e039779a46b4fa14ccfee0e553884c2531bc2caec6f74)
+- **Wasm hash:** `f68a30e74126832be3e8530d667c27f212005a8bbb3de0d096cb869bf46d3911`, built from commit `91ba5df`. Contract source has changed on `main` since then.
+- **Deployer (public address):** `GCEFQRSJTT5KWNZTMXK7GXSC3MC2LHMFW3YRDBKQK2UBIRIGX4KQRHLU`
+- **Manifest:** [`deployments/testnet/kolo-savings-group.json`](deployments/testnet/kolo-savings-group.json)
 
 This deploys the contract code only. It does not create or configure a savings group, select a token, enroll members, or make the contract ready to receive funds. Testnet assets have no real-world value.
+
+The manifest records these values, plus the source commit, toolchain, and initialization state, in a versioned format. Each value can be checked against Stellar Testnet without trusting this repository:
+
+```bash
+python3 scripts/validate_deployment_manifest.py --online deployments/testnet/kolo-savings-group.json
+```
+
+See [deployments/README.md](deployments/README.md) for the format, which values are public, how to verify a deployment by hand with the Stellar CLI, and how to record a new deployment.
 
 ## Why Soroban for community savings
 
